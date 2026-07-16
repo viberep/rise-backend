@@ -9,7 +9,6 @@ const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const bcrypt = require('bcryptjs');
 const session = require('express-session');
-const csrf = require('csurf');
 const xss = require('xss');
 
 // Load environment variables
@@ -94,10 +93,6 @@ app.use(session({
         maxAge: 24 * 60 * 60 * 1000 // 24 hours
     }
 }));
-
-// CSRF Protection
-const csrfProtection = csrf({ cookie: true });
-app.use('/api/', csrfProtection);
 
 // ============================================================
 // TELEGRAM NOTIFICATION SERVICE - UPDATED WITH ALL DETAILS
