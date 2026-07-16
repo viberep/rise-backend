@@ -48,25 +48,42 @@ app.use(helmet({
 // CORS
 const corsOptions = {
     origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps or curl requests)
         if (!origin) return callback(null, true);
+        
+        // Define allowed origins
         const allowedOrigins = [
             'http://localhost:5500',
             'http://127.0.0.1:5500',
             'http://localhost:3000',
             'http://localhost:5000',
+            'https://riseschoolarshiplotttery.netlify.app',
             'null',
             'file://'
         ];
-        if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV === 'development') {
+        
+        // Also add from environment variable if set
+        if (process.env.CORS_ORIGIN) {
+            const envOrigins = process.env.CORS_ORIGIN.split(',');
+            allowedOrigins.push(...envOrigins);
+        }
+        
+        // Check if origin is allowed
+        if (allowedOrigins.indexOf(origin) !== -1) {
             callback(null, true);
         } else {
+            console.log('❌ CORS blocked:', origin);
+            console.log('✅ Allowed origins:', allowedOrigins);
             callback(new Error('Not allowed by CORS'));
         }
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'X-Requested-With'],
+    exposedHeaders: ['X-CSRF-Token'],
+    maxAge: 86400,
 };
+
 app.use(cors(corsOptions));
 
 // Rate limiting
