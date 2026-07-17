@@ -898,6 +898,7 @@ const schoolDatabase = {
     'hawaii.edu': 'University of Hawaii at Manoa',
     'umass.edu': 'University of Massachusetts Amherst',
     'uconn.edu': 'University of Connecticut'
+        
    // ===== NEW SCHOOLS =====
     'iu.edu': 'Indiana University',
     'sierracollege.edu': 'Sierra College',
