@@ -898,6 +898,33 @@ const schoolDatabase = {
     'hawaii.edu': 'University of Hawaii at Manoa',
     'umass.edu': 'University of Massachusetts Amherst',
     'uconn.edu': 'University of Connecticut'
+   // ===== NEW SCHOOLS =====
+    'iu.edu': 'Indiana University',
+    'sierracollege.edu': 'Sierra College',
+    'sfcc.edu': 'Santa Fe Community College',
+    'tamiu.edu': 'Texas A&M International University',
+    'avc.edu': 'Antelope Valley College',
+    'centralaz.edu': 'Central Arizona College',
+    'eccc.edu': 'East Central Community College',
+    'elgin.edu': 'Elgin Community College',
+    'jjc.edu': 'Joliet Junior College',
+    'kctcs.edu': 'Kentucky Community and Technical College System',
+    'lee.edu': 'Lee College',
+    'mccc.edu': 'Mercer County Community College',
+    'msjc.edu': 'Mt. San Jacinto College',
+    
+    // ===== ADD ALSO THESE COMMON VARIATIONS =====
+    'sierra.college.edu': 'Sierra College',
+    'santafe.edu': 'Santa Fe Community College',
+    'tamiu.com': 'Texas A&M International University',
+    'centralarizona.edu': 'Central Arizona College',
+    'eastcentral.edu': 'East Central Community College',
+    'elgincc.edu': 'Elgin Community College',
+    'joliet.edu': 'Joliet Junior College',
+    'kctcs.com': 'Kentucky Community and Technical College System',
+    'lee-college.edu': 'Lee College',
+    'mercercc.edu': 'Mercer County Community College',
+    'mtsanjacinto.edu': 'Mt. San Jacinto College',
 };
 
 function lookupSchool(email) {
