@@ -897,7 +897,7 @@ const schoolDatabase = {
     'alaska.edu': 'University of Alaska Fairbanks',
     'hawaii.edu': 'University of Hawaii at Manoa',
     'umass.edu': 'University of Massachusetts Amherst',
-    'uconn.edu': 'University of Connecticut'
+    'uconn.edu': 'University of Connecticut',
         
    // ===== NEW SCHOOLS =====
     'iu.edu': 'Indiana University',
